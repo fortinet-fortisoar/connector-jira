@@ -5,12 +5,12 @@
   "publisher": "Fortinet",
   "cs_approved": true,
   "cs_compatible": true,
-  "version": "2.0.0",
+  "version": "3.0.0",
   "category": "Ticket Creation",
-  "contributor": "",
+  "contributor": "Dylan Spille",
   "icon_small_name": "jira_small.png",
   "icon_large_name": "jira_large.png",
-  "help_online": "https://docs.fortinet.com/document/fortisoar/2.0.0/jira/200/jira-v2-0-0",
+  "help_online": "",
   "configuration": {
     "fields": [
       {
@@ -23,22 +23,81 @@
         "name": "server_url"
       },
       {
-        "title": "Username",
-        "description": "Username configured for your account to access the Jira server from where the connector gets notifications.",
+        "title": "Authentication Type",
+        "name": "auth_type",
+        "type": "select",
         "required": true,
         "editable": true,
         "visible": true,
-        "type": "text",
-        "name": "username"
-      },
-      {
-        "title": "API Token",
-        "description": "API Token configured for your account to access the Jira server from where the connector gets notifications.",
-        "required": true,
-        "editable": true,
-        "visible": true,
-        "type": "password",
-        "name": "token"
+        "options": [
+          "Cloud (Email + API Token)",
+          "Server / Data Center (Personal Access Token)",
+          "Server / Data Center (Username + Password)"
+        ],
+        "value": "Cloud (Email + API Token)",
+        "tooltip": "Selects both the credential type and the Jira REST API surface. Cloud uses /rest/api/3/ with Atlassian Document Format. Server / Data Center uses /rest/api/2/ with plain-text descriptions and comments. Personal Access Token requires Jira Server 8.14+.",
+        "description": "Selects both the credential type and the Jira REST API surface. Cloud -> /rest/api/3/ + ADF. Server/DC -> /rest/api/2/ + plain text.",
+        "onchange": {
+          "Cloud (Email + API Token)": [
+            {
+              "title": "Email",
+              "name": "username",
+              "type": "text",
+              "required": true,
+              "editable": true,
+              "visible": true,
+              "description": "Email address of the Atlassian account.",
+              "tooltip": "Email address of the Atlassian account."
+            },
+            {
+              "title": "API Token",
+              "name": "token",
+              "type": "password",
+              "required": true,
+              "editable": true,
+              "visible": true,
+              "value": "",
+              "description": "API token generated at id.atlassian.com/manage-profile/security/api-tokens.",
+              "tooltip": "API token generated at id.atlassian.com/manage-profile/security/api-tokens."
+            }
+          ],
+          "Server / Data Center (Personal Access Token)": [
+            {
+              "title": "Personal Access Token",
+              "name": "pat",
+              "type": "password",
+              "required": true,
+              "editable": true,
+              "visible": true,
+              "value": "",
+              "description": "Jira Server / DC PAT (8.14+). Sent as 'Authorization: Bearer <token>'.",
+              "tooltip": "Jira Server / DC PAT (8.14+). Sent as 'Authorization: Bearer <token>'."
+            }
+          ],
+          "Server / Data Center (Username + Password)": [
+            {
+              "title": "Username",
+              "name": "username",
+              "type": "text",
+              "required": true,
+              "editable": true,
+              "visible": true,
+              "description": "Username for the on-prem Jira account.",
+              "tooltip": "Username for the on-prem Jira account."
+            },
+            {
+              "title": "Password",
+              "name": "password",
+              "type": "password",
+              "required": true,
+              "editable": true,
+              "visible": true,
+              "value": "",
+              "description": "Password for the on-prem Jira account.",
+              "tooltip": "Password for the on-prem Jira account."
+            }
+          ]
+        }
       },
       {
         "title": "Verify SSL",

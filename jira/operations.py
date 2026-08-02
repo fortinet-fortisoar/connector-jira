@@ -1,7 +1,7 @@
 """
 Copyright start
 MIT License
-Copyright (c) 2025 Fortinet Inc
+Copyright (c) 2026 Fortinet Inc
 Copyright end
 """
 
@@ -16,6 +16,57 @@ from django.conf import settings
 
 logger = get_logger('jira')
 
+CLOUD_AUTH = 'Cloud (Email + API Token)'
+SERVER_PAT_AUTH = 'Server / Data Center (Personal Access Token)'
+SERVER_BASIC_AUTH = 'Server / Data Center (Username + Password)'
+
+
+def _auth_type(config):
+    return (config.get('auth_type') or CLOUD_AUTH).strip()
+
+
+def _is_cloud(config):
+    return _auth_type(config) == CLOUD_AUTH
+
+
+def _api_version(config):
+    # Cloud -> v3, Server / Data Center -> v2
+    return '3' if _is_cloud(config) else '2'
+
+
+def _issue_endpoint(config):
+    return '/rest/api/{0}/issue/'.format(_api_version(config))
+
+
+def _search_jql_endpoint(config):
+    # v3 has /search/jql, v2 uses /search
+    return '/rest/api/3/search/jql' if _is_cloud(config) else '/rest/api/2/search'
+
+
+def _description_body(text, config):
+    """Cloud requires Atlassian Document Format; Server / DC takes a plain string."""
+    if not text:
+        return text
+    if _is_cloud(config):
+        return {
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "paragraph",
+                "content": [{"type": "text", "text": text}],
+            }],
+        }
+    return text
+
+
+def _comment_add_body(text, config):
+    """Body shape for issue.update -> update.comment[].add.body."""
+    if not text:
+        return text
+    return _description_body(text, config) if _is_cloud(config) else text
+
+
+# Kept for backward compatibility — defaults to Cloud (v3) if a caller imports it directly.
 ENDPOINT = '/rest/api/3/issue/'
 SEARCH_JQL_ENDPOINT = '/rest/api/3/search/jql'
 
@@ -53,7 +104,9 @@ def get_config(config):
 
 
 def make_api_call(config, method, endpoint=None, json=None, headers=None, files=None, params=None, data=None):
-    server, username, authentication, token, verify_ssl = get_config(config)
+    server = config.get('server_url') or ''
+    verify_ssl = config.get('verify_ssl')
+    auth_type = _auth_type(config)
     if server.startswith('https://'):
         server = server.strip('/')
     else:
@@ -61,16 +114,27 @@ def make_api_call(config, method, endpoint=None, json=None, headers=None, files=
             server = 'https://{0}'.format(server)
     if not headers:
         headers = {'content-type': 'application/json', 'accept': 'application/json'}
-    if endpoint:
-        url = '{0}{1}'.format(server, endpoint)
-    else:
-        url = server
+    url = '{0}{1}'.format(server, endpoint) if endpoint else server
 
-    if headers:
+    auth = None
+    if auth_type == CLOUD_AUTH:
+        username = config.get('username') or ''
+        token = config.get('token') or ''
+        encoded = b64encode('{0}:{1}'.format(username, token).encode('utf-8')).decode('utf-8')
+        headers['Authorization'] = 'Basic {0}'.format(encoded)
         auth = (username, token)
-        to_encode = '{}:{}'.format(username, token)
-        encoded_auth = b64encode(bytes(to_encode, 'utf-8')).decode('utf-8')
-        headers['Authorization'] = 'Basic {}'.format(encoded_auth)
+    elif auth_type == SERVER_BASIC_AUTH:
+        username = config.get('username') or ''
+        password = config.get('password') or ''
+        encoded = b64encode('{0}:{1}'.format(username, password).encode('utf-8')).decode('utf-8')
+        headers['Authorization'] = 'Basic {0}'.format(encoded)
+        auth = (username, password)
+    elif auth_type == SERVER_PAT_AUTH:
+        pat = config.get('pat') or ''
+        headers['Authorization'] = 'Bearer {0}'.format(pat)
+    else:
+        raise ConnectorError('Unsupported Authentication Type: {0}'.format(auth_type))
+
     logger.info('Request URL {}'.format(url))
     try:
         response = requests.request(method=method, url=url, auth=auth, headers=headers, files=files,
@@ -141,21 +205,7 @@ def create_ticket(config, params, **kwargs):
                     "key": project_key
                 },
                 "summary": ticket_summary,
-                "description": {
-                    "content": [
-                        {
-                            "content": [
-                                {
-                                    "text": ticket_description,
-                                    "type": "text"
-                                }
-                            ],
-                            "type": "paragraph"
-                        }
-                    ],
-                    "type": "doc",
-                    "version": 1
-                },
+                "description": _description_body(ticket_description, config),
                 "issuetype": {
                     "name": issue_type
                 },
@@ -172,7 +222,7 @@ def create_ticket(config, params, **kwargs):
             }
             body['fields'].update(parent_body)
         payload1 = check_payload(body)
-        response = make_api_call(config, method='POST', endpoint=ENDPOINT, json=json.dumps(payload1))
+        response = make_api_call(config, method='POST', endpoint=_issue_endpoint(config), json=json.dumps(payload1))
         if response.ok:
             contents = json.loads(response.content.decode('UTF-8'))
             key_id = contents['key']
@@ -192,7 +242,7 @@ def create_ticket(config, params, **kwargs):
 def get_ticket_details(config, params, **kwargs):
     try:
         issue_key = params.get('issue_key')
-        endpoint = "{0}{1}".format(ENDPOINT, issue_key)
+        endpoint = "{0}{1}".format(_issue_endpoint(config), issue_key)
         response = make_api_call(config, method='GET', endpoint=endpoint)
         logger.info('Returning ticket status response : [{0}]'.format(response))
         if response.ok:
@@ -212,26 +262,12 @@ def update_ticket(config, params, **kwargs):
         description = params.get('description')
         comment = params.get('comment')
         if comment:
-            comment = {
-                "content": [
-                    {
-                        "content": [
-                            {
-                                "text": comment,
-                                "type": "text"
-                            }
-                        ],
-                        "type": "paragraph"
-                    }
-                ],
-                "type": "doc",
-                "version": 1
-            }
+            comment = _comment_add_body(comment, config)
         priority = params.get('priority')
         status = params.get('status')
         other_fields = params.get('other_fields')
         if status:
-            transition_endpoint = "{0}{1}{2}".format(ENDPOINT, issue_key,
+            transition_endpoint = "{0}{1}{2}".format(_issue_endpoint(config), issue_key,
                                                      '/transitions?expand=transitions.fields')
             transition_response = make_api_call(config, method='GET', endpoint=transition_endpoint)
             transitions = json.loads(transition_response.content.decode('UTF-8'))
@@ -243,7 +279,7 @@ def update_ticket(config, params, **kwargs):
                     "id": id[0]
                 }
             }
-            endpoint = "{0}{1}{2}".format(ENDPOINT, issue_key,
+            endpoint = "{0}{1}{2}".format(_issue_endpoint(config), issue_key,
                                           '/transitions?expand=transitions.fields')
             status_response = make_api_call(config, method='POST', endpoint=endpoint, json=json.dumps(body))
         body = {
@@ -261,27 +297,13 @@ def update_ticket(config, params, **kwargs):
                     "key": project_key
                 },
                 "summary": summary,
-                "description": {
-                    "content": [
-                        {
-                            "content": [
-                                {
-                                    "text": description,
-                                    "type": "text"
-                                }
-                            ],
-                            "type": "paragraph"
-                        }
-                    ],
-                    "type": "doc",
-                    "version": 1
-                },
+                "description": _description_body(description, config),
                 "priority": {"name": priority}
             }
         }
         if other_fields:
             body['fields'].update(other_fields)
-        endpoint = "{0}{1}".format(ENDPOINT, issue_key)
+        endpoint = "{0}{1}".format(_issue_endpoint(config), issue_key)
         payload1 = check_payload(body)
         response = make_api_call(config, method='PUT', endpoint=endpoint, json=json.dumps(payload1))
         logger.info('Returning update ticket response : [{0}]'.format(response))
@@ -318,7 +340,7 @@ def _get_file_data(iri_type, iri):
 
 def submit_file(config, params, **kwargs):
     issue_key = params.get('issue_key')
-    endpoint = "{0}{1}{2}".format(ENDPOINT, issue_key, '/attachments')
+    endpoint = "{0}{1}{2}".format(_issue_endpoint(config), issue_key, '/attachments')
     iri_type = params.get('path')
     iri = params.get('value')
     file_name, file_path = _get_file_data(iri_type, iri)
@@ -335,7 +357,7 @@ def submit_file(config, params, **kwargs):
 def add_remote_link(config, params, **kwargs):
     try:
         issue_key = params.get('issue_key')
-        endpoint = "{0}{1}{2}".format(ENDPOINT, issue_key, '/remotelink')
+        endpoint = "{0}{1}{2}".format(_issue_endpoint(config), issue_key, '/remotelink')
         payload = {
             "object": {
                 "url": params.get('url'),
@@ -358,24 +380,8 @@ def add_comment(config, params, **kwargs):
     try:
         issue_key = params.get('issue_key')
         comment = params.get('comment')
-        body = {
-            "body": {
-                "content": [
-                    {
-                        "content": [
-                            {
-                                "text": comment,
-                                "type": "text"
-                            }
-                        ],
-                        "type": "paragraph"
-                    }
-                ],
-                "type": "doc",
-                "version": 1
-            }
-        }
-        endpoint = "{0}{1}{2}".format(ENDPOINT, issue_key, '/comment')
+        body = {"body": _description_body(comment, config)}
+        endpoint = "{0}{1}{2}".format(_issue_endpoint(config), issue_key, '/comment')
         response = make_api_call(config, method='POST', endpoint=endpoint, json=json.dumps(body))
         logger.info('Returning comment ticket response : [{0}]'.format(response))
         if response.ok:
@@ -401,7 +407,7 @@ def get_comments(config, params, **kwargs):
             "maxResults": params.get('maxResults'),
             "orderBy": orderBy
         }
-        endpoint = "{0}{1}{2}".format(ENDPOINT, issue_key, '/comment')
+        endpoint = "{0}{1}{2}".format(_issue_endpoint(config), issue_key, '/comment')
         payload = {k: v for k, v in payload.items() if v is not None and v != ''}
         response = make_api_call(config, method='GET', endpoint=endpoint, params=payload)
         logger.info('Returning comment ticket response : [{0}]'.format(response))
@@ -418,8 +424,8 @@ def delete_ticket(config, params, **kwargs):
     try:
         issue_key = params.get('issue_key')
         delete_subtask = params.get('delete_subtask')
-        endpoint = "{0}{1}".format(ENDPOINT, issue_key)
-        endpoint_issue_info = "{0}{1}".format(ENDPOINT, issue_key)
+        endpoint = "{0}{1}".format(_issue_endpoint(config), issue_key)
+        endpoint_issue_info = "{0}{1}".format(_issue_endpoint(config), issue_key)
         response_issue_info = make_api_call(config, method='GET', endpoint=endpoint_issue_info)
         logger.info('Returning ticket status response : [{0}]'.format(response_issue_info))
         if response_issue_info.ok:
@@ -440,7 +446,7 @@ def delete_ticket(config, params, **kwargs):
 
 def list_projects(config, params, **kwargs):
     try:
-        endpoint = '/rest/api/3/project/search'
+        endpoint = '/rest/api/{0}/project/search'.format(_api_version(config))
         response = make_api_call(config, method='GET', endpoint=endpoint)
         logger.info('Returning Project lists response : [{0}]'.format(response))
         if response.ok:
@@ -463,7 +469,7 @@ def list_tickets(config, params, **kwargs):
         else:
             if not isinstance(fields, list):
                 fields = fields.split(",")
-        endpoint = "{0}".format(SEARCH_JQL_ENDPOINT)
+        endpoint = _search_jql_endpoint(config)
         project_key = re.search(r"project\s?=\s?(\w+)", jql_query)
         if project_key is None:
             raise ConnectorError(
@@ -499,6 +505,9 @@ def list_tickets(config, params, **kwargs):
 
 def validate_jql_query(config, params, **kwargs):
     try:
+        # /jql/parse only exists on Cloud (v3); Server / DC has no equivalent.
+        if not _is_cloud(config):
+            raise ConnectorError("'JQL parse' is supported only on Jira Cloud (REST v3). Your configured deployment is Server / Data Center.")
         endpoint = '/rest/api/3/jql/parse'
         jql_query = params.get('jql_query')
         payload = {
@@ -517,7 +526,8 @@ def validate_jql_query(config, params, **kwargs):
 
 def search_users(config, params, **kwargs):
     try:
-        endpoint = '/rest/api/3/users/search'
+        # Cloud: /users/search returns all users; Server / DC: /user/search requires a query param.
+        endpoint = '/rest/api/3/users/search' if _is_cloud(config) else '/rest/api/2/user/search'
         url_params = {
             'startAt': params.get('startAt', 0),
             'maxResults': params.get('maxResults', 50)
@@ -534,7 +544,7 @@ def search_users(config, params, **kwargs):
 
 def get_user_details(config, params, **kwargs):
     try:
-        endpoint = '/rest/api/3/user'
+        endpoint = '/rest/api/{0}/user'.format(_api_version(config))
         url_params = {
             'accountId': params.get('accountId'),
             'expand': 'groups,applicationRoles'
@@ -553,7 +563,7 @@ def assign_issue(config, params, **kwargs):
     try:
         accountId = params.get('accountId', None)
         issue_key = params.get('issue_key')
-        endpoint = '/rest/api/3/issue/{0}/assignee'.format(issue_key)
+        endpoint = '/rest/api/{0}/issue/{1}/assignee'.format(_api_version(config), issue_key)
         payload = {
             'accountId': accountId
         }
@@ -572,7 +582,7 @@ def set_status(config, params, **kwargs):
     try:
         issue_key = params.get('issue_key')
         status = params.get('status')
-        transition_endpoint = "{0}{1}{2}".format(ENDPOINT, issue_key,
+        transition_endpoint = "{0}{1}{2}".format(_issue_endpoint(config), issue_key,
                                                  '/transitions?expand=transitions.fields')
         transition_response = make_api_call(config, method='GET', endpoint=transition_endpoint)
         transitions = json.loads(transition_response.content.decode('UTF-8'))
@@ -585,7 +595,7 @@ def set_status(config, params, **kwargs):
             }
         }
         payload1 = check_payload(body)
-        endpoint = "{0}{1}{2}".format(ENDPOINT, issue_key, '/transitions?expand=transitions.fields')
+        endpoint = "{0}{1}{2}".format(_issue_endpoint(config), issue_key, '/transitions?expand=transitions.fields')
         response = make_api_call(config, method='POST', endpoint=endpoint, json=json.dumps(payload1))
         logger.info('Returning update ticket response : [{0}]'.format(response))
         if response.ok:
